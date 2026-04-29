@@ -3,6 +3,8 @@
 #include "Windowed_GtaVC.h"
 #include "Windowed_GtaSA.h"
 #include <dwmapi.h>
+#include <dsound.h>
+#include <unordered_set>
 
 #pragma comment(lib, "dwmapi.lib") // DwmGetWindowAttribute
 #pragma comment(lib, "winmm.lib") // timeGetTime
@@ -17,6 +19,569 @@ const WindowedMode::AspectRatioInfo WindowedMode::AspectRatios[] = {
 	{ "16:9", 16.0f / 9.0f },
 	{ "16:10", 16.0f / 10.0f }
 };
+
+namespace
+{
+	// Some SA-MP servers use BASS (PlayAudioStreamForPlayer) and its DirectSound output can become
+	// silent when the game's window loses focus. Forcing DSBCAPS_GLOBALFOCUS on secondary buffers
+	// keeps those streams playing in the background.
+	static bool g_dsoundHooksInstalled = false;
+	static SafetyHookInline g_dsoundCreateHook;
+	static SafetyHookInline g_dsoundCreate8Hook;
+
+	static SafetyHookVmt g_dsoundVmtHook;
+	static bool g_dsoundVmtHookInitialized = false;
+	static SafetyHookVm g_createSoundBufferHook;
+
+	static HRESULT __stdcall DirectSound_CreateSoundBuffer_Hook(void* self, LPCDSBUFFERDESC desc,
+		LPDIRECTSOUNDBUFFER* ppBuffer, LPUNKNOWN pUnkOuter)
+	{
+		if (!desc || (desc->dwFlags & DSBCAPS_PRIMARYBUFFER) != 0)
+		{
+			return g_createSoundBufferHook.stdcall<HRESULT>(self, desc, ppBuffer, pUnkOuter);
+		}
+
+		DSBUFFERDESC modified{};
+		auto copySize = static_cast<size_t>(desc->dwSize);
+		if (copySize > sizeof(modified))
+			copySize = sizeof(modified);
+		std::memcpy(&modified, desc, copySize);
+
+		modified.dwFlags |= DSBCAPS_GLOBALFOCUS;
+		return g_createSoundBufferHook.stdcall<HRESULT>(self, &modified, ppBuffer, pUnkOuter);
+	}
+
+	static void DirectSound_HookInstance(void* dsound)
+	{
+		if (!dsound)
+			return;
+
+		if (!g_dsoundVmtHookInitialized)
+		{
+			auto hook = SafetyHookVmt::create(dsound);
+			if (!hook.has_value())
+				return;
+
+			g_dsoundVmtHook = std::move(*hook);
+			g_dsoundVmtHookInitialized = true;
+
+			auto vm = g_dsoundVmtHook.hook_method(3, &DirectSound_CreateSoundBuffer_Hook);
+			if (!vm.has_value())
+				return;
+
+			g_createSoundBufferHook = std::move(*vm);
+		}
+		else
+		{
+			g_dsoundVmtHook.apply(dsound);
+		}
+	}
+
+	static HRESULT WINAPI DirectSoundCreate_Hook(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS,
+		LPUNKNOWN pUnkOuter)
+	{
+		auto hr = g_dsoundCreateHook.stdcall<HRESULT>(pcGuidDevice, ppDS, pUnkOuter);
+		if (SUCCEEDED(hr) && ppDS && *ppDS)
+			DirectSound_HookInstance(*ppDS);
+		return hr;
+	}
+
+	static HRESULT WINAPI DirectSoundCreate8_Hook(LPCGUID pcGuidDevice, LPDIRECTSOUND8* ppDS8,
+		LPUNKNOWN pUnkOuter)
+	{
+		auto hr = g_dsoundCreate8Hook.stdcall<HRESULT>(pcGuidDevice, ppDS8, pUnkOuter);
+		if (SUCCEEDED(hr) && ppDS8 && *ppDS8)
+			DirectSound_HookInstance(*ppDS8);
+		return hr;
+	}
+
+	static void InstallDirectSoundHooks()
+	{
+		if (g_dsoundHooksInstalled)
+			return;
+		g_dsoundHooksInstalled = true;
+
+		auto dsound = GetModuleHandleA("dsound.dll");
+		if (!dsound)
+			dsound = LoadLibraryA("dsound.dll");
+		if (!dsound)
+			return;
+
+		if (auto proc = GetProcAddress(dsound, "DirectSoundCreate"))
+		{
+			auto hook = SafetyHookInline::create(proc, &DirectSoundCreate_Hook);
+			if (hook.has_value())
+				g_dsoundCreateHook = std::move(*hook);
+		}
+
+		if (auto proc = GetProcAddress(dsound, "DirectSoundCreate8"))
+		{
+			auto hook = SafetyHookInline::create(proc, &DirectSoundCreate8_Hook);
+			if (hook.has_value())
+				g_dsoundCreate8Hook = std::move(*hook);
+		}
+	}
+
+	// SA-MP (PlayAudioStreamForPlayer) uses BASS for URL streaming.
+	// Many builds pause/stop BASS playback when the game loses focus.
+	// Hook BASS so that focus-loss does not pause/stop/mute URL streams.
+	static bool g_bassInlineHooksInstalled = false;
+	static bool g_bassIatHooksInstalled = false;
+
+	using BASS_StreamCreateURL_t = DWORD(WINAPI*)(const char* url, DWORD offset, DWORD flags, void* proc, void* user);
+	using BASS_StreamFree_t = BOOL(WINAPI*)(DWORD handle);
+	using BASS_ChannelPause_t = BOOL(WINAPI*)(DWORD handle);
+	using BASS_ChannelStop_t = BOOL(WINAPI*)(DWORD handle);
+	using BASS_ChannelSetAttribute_t = BOOL(WINAPI*)(DWORD handle, DWORD attrib, float value);
+	using BASS_ChannelSlideAttribute_t = BOOL(WINAPI*)(DWORD handle, DWORD attrib, float value, DWORD time);
+	using BASS_Pause_t = BOOL(WINAPI*)();
+	using BASS_Stop_t = BOOL(WINAPI*)();
+	using BASS_SetConfig_t = BOOL(WINAPI*)(DWORD option, DWORD value);
+	using BASS_SetVolume_t = BOOL(WINAPI*)(float volume);
+	using BASS_Update_t = BOOL(WINAPI*)(DWORD length);
+	using BASS_Free_t = BOOL(WINAPI*)();
+
+	static SafetyHookInline g_bassStreamCreateURLInline;
+	static SafetyHookInline g_bassStreamFreeInline;
+	static SafetyHookInline g_bassChannelPauseInline;
+	static SafetyHookInline g_bassChannelStopInline;
+	static SafetyHookInline g_bassChannelSetAttributeInline;
+	static SafetyHookInline g_bassChannelSlideAttributeInline;
+	static SafetyHookInline g_bassPauseInline;
+	static SafetyHookInline g_bassStopInline;
+	static SafetyHookInline g_bassSetConfigInline;
+	static SafetyHookInline g_bassSetVolumeInline;
+	static SafetyHookInline g_bassFreeInline;
+
+	static BASS_StreamCreateURL_t g_bassStreamCreateURLOri = nullptr;
+	static BASS_StreamFree_t g_bassStreamFreeOri = nullptr;
+	static BASS_ChannelPause_t g_bassChannelPauseOri = nullptr;
+	static BASS_ChannelStop_t g_bassChannelStopOri = nullptr;
+	static BASS_ChannelSetAttribute_t g_bassChannelSetAttributeOri = nullptr;
+	static BASS_ChannelSlideAttribute_t g_bassChannelSlideAttributeOri = nullptr;
+	static BASS_Pause_t g_bassPauseOri = nullptr;
+	static BASS_Stop_t g_bassStopOri = nullptr;
+	static BASS_SetConfig_t g_bassSetConfigOri = nullptr;
+	static BASS_SetVolume_t g_bassSetVolumeOri = nullptr;
+	static BASS_Update_t g_bassUpdateOri = nullptr;
+	static BASS_Free_t g_bassFreeOri = nullptr;
+
+	static std::unordered_set<DWORD> g_bassUrlStreams;
+	static std::mutex g_bassMutex;
+
+	static bool g_lastFocusState = true;
+	static DWORD g_lastFocusLostTick = 0;
+
+	static std::atomic_bool g_bassUpdateThreadStarted = false;
+	static HANDLE g_bassUpdateThreadHandle = nullptr;
+
+	static inline bool IsGameWindowFocused()
+	{
+		return inst && inst->window && HasFocus(inst->window);
+	}
+
+	static inline bool IsRecentFocusLoss(DWORD thresholdMs = 2000)
+	{
+		if (IsGameWindowFocused())
+			return false;
+		if (g_lastFocusLostTick == 0)
+			return true; // unknown; be permissive
+		return (timeGetTime() - g_lastFocusLostTick) <= thresholdMs;
+	}
+
+	static void UpdateFocusTracking()
+	{
+		if (!inst || !inst->window)
+			return;
+
+		const bool focused = HasFocus(inst->window);
+		if (focused == g_lastFocusState)
+			return;
+
+		g_lastFocusState = focused;
+		if (!focused)
+			g_lastFocusLostTick = timeGetTime();
+	}
+
+	static inline bool IsUrlStreamHandle(DWORD handle)
+	{
+		std::scoped_lock lock(g_bassMutex);
+		// If URL stream tracking isn't working (e.g., StreamCreateURL couldn't be hooked),
+		// fail-open to still keep background streams alive.
+		if (g_bassUrlStreams.empty())
+			return true;
+		return g_bassUrlStreams.contains(handle);
+	}
+
+	static DWORD WINAPI BASS_StreamCreateURL_Hook(const char* url, DWORD offset, DWORD flags, void* proc, void* user)
+	{
+		if (!g_bassStreamCreateURLOri)
+			return 0;
+
+		const auto handle = g_bassStreamCreateURLOri(url, offset, flags, proc, user);
+		if (handle)
+		{
+			std::scoped_lock lock(g_bassMutex);
+			g_bassUrlStreams.insert(handle);
+		}
+		return handle;
+	}
+
+	static BOOL WINAPI BASS_StreamFree_Hook(DWORD handle)
+	{
+		if (IsRecentFocusLoss() && IsUrlStreamHandle(handle))
+			return TRUE;
+
+		if (!g_bassStreamFreeOri)
+			return FALSE;
+
+		const auto ok = g_bassStreamFreeOri(handle);
+		if (ok)
+		{
+			std::scoped_lock lock(g_bassMutex);
+			g_bassUrlStreams.erase(handle);
+		}
+		return ok;
+	}
+
+	static BOOL WINAPI BASS_ChannelPause_Hook(DWORD handle)
+	{
+		if (!IsGameWindowFocused() && IsUrlStreamHandle(handle))
+			return TRUE;
+		return g_bassChannelPauseOri ? g_bassChannelPauseOri(handle) : FALSE;
+	}
+
+	static BOOL WINAPI BASS_ChannelStop_Hook(DWORD handle)
+	{
+		// Stop is more likely to be a "real" stop (server command), so only suppress it
+		// when it happens immediately after losing focus.
+		if (IsRecentFocusLoss() && IsUrlStreamHandle(handle))
+			return TRUE;
+		return g_bassChannelStopOri ? g_bassChannelStopOri(handle) : FALSE;
+	}
+
+	static constexpr DWORD BASS_ATTRIB_VOL = 2;
+	static constexpr DWORD BASS_CONFIG_GVOL_SAMPLE = 4;
+	static constexpr DWORD BASS_CONFIG_GVOL_STREAM = 5;
+	static constexpr DWORD BASS_CONFIG_GVOL_MUSIC = 6;
+
+	static BOOL WINAPI BASS_ChannelSetAttribute_Hook(DWORD handle, DWORD attrib, float value)
+	{
+		if (!IsGameWindowFocused() && attrib == BASS_ATTRIB_VOL && value <= 0.001f && IsUrlStreamHandle(handle))
+			return TRUE;
+		return g_bassChannelSetAttributeOri ? g_bassChannelSetAttributeOri(handle, attrib, value) : FALSE;
+	}
+
+	static BOOL WINAPI BASS_ChannelSlideAttribute_Hook(DWORD handle, DWORD attrib, float value, DWORD time)
+	{
+		if (!IsGameWindowFocused() && attrib == BASS_ATTRIB_VOL && value <= 0.001f && IsUrlStreamHandle(handle))
+			return TRUE;
+		return g_bassChannelSlideAttributeOri ? g_bassChannelSlideAttributeOri(handle, attrib, value, time) : FALSE;
+	}
+
+	static BOOL WINAPI BASS_SetConfig_Hook(DWORD option, DWORD value)
+	{
+		// SA-MP may mute all BASS output on focus loss by setting global volume to 0.
+		if (!IsGameWindowFocused() && value == 0 &&
+			(option == BASS_CONFIG_GVOL_SAMPLE || option == BASS_CONFIG_GVOL_STREAM || option == BASS_CONFIG_GVOL_MUSIC))
+		{
+			return TRUE;
+		}
+		return g_bassSetConfigOri ? g_bassSetConfigOri(option, value) : FALSE;
+	}
+
+	static BOOL WINAPI BASS_SetVolume_Hook(float volume)
+	{
+		if (!IsGameWindowFocused() && volume <= 0.001f)
+			return TRUE;
+		return g_bassSetVolumeOri ? g_bassSetVolumeOri(volume) : FALSE;
+	}
+
+	static BOOL WINAPI BASS_Pause_Hook()
+	{
+		if (IsRecentFocusLoss())
+			return TRUE;
+		return g_bassPauseOri ? g_bassPauseOri() : FALSE;
+	}
+
+	static BOOL WINAPI BASS_Stop_Hook()
+	{
+		if (IsRecentFocusLoss())
+			return TRUE;
+		return g_bassStopOri ? g_bassStopOri() : FALSE;
+	}
+
+	static BOOL WINAPI BASS_Free_Hook()
+	{
+		if (IsRecentFocusLoss())
+			return TRUE;
+		return g_bassFreeOri ? g_bassFreeOri() : FALSE;
+	}
+
+	static DWORD WINAPI BassUpdateThreadProc(LPVOID)
+	{
+		while (true)
+		{
+			Sleep(50);
+			if (!g_bassUpdateOri)
+				continue;
+			if (!inst || !inst->window)
+				continue;
+			if (HasFocus(inst->window))
+				continue;
+
+			bool hasStreams = false;
+			{
+				std::scoped_lock lock(g_bassMutex);
+				hasStreams = !g_bassUrlStreams.empty();
+			}
+			if (!hasStreams)
+				continue;
+
+			g_bassUpdateOri(0);
+		}
+	}
+
+	static void EnsureBassUpdateThread()
+	{
+		if (g_bassUpdateThreadStarted.exchange(true))
+			return;
+
+		g_bassUpdateThreadHandle = CreateThread(nullptr, 0, &BassUpdateThreadProc, nullptr, 0, nullptr);
+		if (!g_bassUpdateThreadHandle)
+			g_bassUpdateThreadStarted = false;
+	}
+
+	static bool HookIatFunction(HMODULE module, const char* importedModuleName, const char* functionName,
+		void* newFunction, void** originalFunction)
+	{
+		if (!module || !importedModuleName || !functionName || !newFunction)
+			return false;
+
+		auto base = reinterpret_cast<uint8_t*>(module);
+		auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+			return false;
+
+		auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE)
+			return false;
+
+		auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!dir.VirtualAddress)
+			return false;
+
+		auto imports = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + dir.VirtualAddress);
+		for (; imports->Name; ++imports)
+		{
+			const char* dllName = reinterpret_cast<const char*>(base + imports->Name);
+			if (_stricmp(dllName, importedModuleName) != 0)
+				continue;
+
+			auto origThunk = imports->OriginalFirstThunk ?
+				reinterpret_cast<PIMAGE_THUNK_DATA>(base + imports->OriginalFirstThunk) : nullptr;
+			auto firstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + imports->FirstThunk);
+
+			for (; firstThunk->u1.Function; ++firstThunk, origThunk = origThunk ? (origThunk + 1) : nullptr)
+			{
+				auto thunkForName = origThunk ? origThunk : firstThunk;
+				if (thunkForName->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+					continue;
+
+				auto importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + thunkForName->u1.AddressOfData);
+				if (std::strcmp(reinterpret_cast<const char*>(importByName->Name), functionName) != 0)
+					continue;
+
+				DWORD oldProtect;
+				if (!VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect))
+					return false;
+
+				auto prev = reinterpret_cast<void*>(static_cast<uintptr_t>(firstThunk->u1.Function));
+				firstThunk->u1.Function = reinterpret_cast<uintptr_t>(newFunction);
+				VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
+
+				if (originalFunction && !*originalFunction)
+					*originalFunction = prev;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	static void InstallBassIatHooks()
+	{
+		if (g_bassIatHooksInstalled)
+			return;
+
+		HMODULE targets[] = { GetModuleHandleA("samp.dll"), GetModuleHandleA(nullptr) };
+		bool any = false;
+		for (auto mod : targets)
+		{
+			if (!mod)
+				continue;
+
+			any |= HookIatFunction(mod, "bass.dll", "BASS_StreamCreateURL", (void*)&BASS_StreamCreateURL_Hook, (void**)&g_bassStreamCreateURLOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_StreamFree", (void*)&BASS_StreamFree_Hook, (void**)&g_bassStreamFreeOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_ChannelPause", (void*)&BASS_ChannelPause_Hook, (void**)&g_bassChannelPauseOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_ChannelStop", (void*)&BASS_ChannelStop_Hook, (void**)&g_bassChannelStopOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_ChannelSetAttribute", (void*)&BASS_ChannelSetAttribute_Hook, (void**)&g_bassChannelSetAttributeOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_ChannelSlideAttribute", (void*)&BASS_ChannelSlideAttribute_Hook, (void**)&g_bassChannelSlideAttributeOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_Pause", (void*)&BASS_Pause_Hook, (void**)&g_bassPauseOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_Stop", (void*)&BASS_Stop_Hook, (void**)&g_bassStopOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_SetConfig", (void*)&BASS_SetConfig_Hook, (void**)&g_bassSetConfigOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_SetVolume", (void*)&BASS_SetVolume_Hook, (void**)&g_bassSetVolumeOri);
+			any |= HookIatFunction(mod, "bass.dll", "BASS_Free", (void*)&BASS_Free_Hook, (void**)&g_bassFreeOri);
+		}
+
+		g_bassIatHooksInstalled = any;
+	}
+
+	static void InstallBassHooks()
+	{
+		auto bass = GetModuleHandleA("bass.dll");
+		if (bass)
+		{
+			if (!g_bassUpdateOri)
+				g_bassUpdateOri = reinterpret_cast<BASS_Update_t>(GetProcAddress(bass, "BASS_Update"));
+
+			if (!g_bassInlineHooksInstalled)
+			{
+				bool any = false;
+
+				if (auto proc = GetProcAddress(bass, "BASS_StreamCreateURL"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_StreamCreateURL_Hook);
+					if (hook.has_value())
+					{
+						g_bassStreamCreateURLInline = std::move(*hook);
+						g_bassStreamCreateURLOri = g_bassStreamCreateURLInline.original<BASS_StreamCreateURL_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_StreamFree"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_StreamFree_Hook);
+					if (hook.has_value())
+					{
+						g_bassStreamFreeInline = std::move(*hook);
+						g_bassStreamFreeOri = g_bassStreamFreeInline.original<BASS_StreamFree_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_ChannelPause"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_ChannelPause_Hook);
+					if (hook.has_value())
+					{
+						g_bassChannelPauseInline = std::move(*hook);
+						g_bassChannelPauseOri = g_bassChannelPauseInline.original<BASS_ChannelPause_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_ChannelStop"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_ChannelStop_Hook);
+					if (hook.has_value())
+					{
+						g_bassChannelStopInline = std::move(*hook);
+						g_bassChannelStopOri = g_bassChannelStopInline.original<BASS_ChannelStop_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_ChannelSetAttribute"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_ChannelSetAttribute_Hook);
+					if (hook.has_value())
+					{
+						g_bassChannelSetAttributeInline = std::move(*hook);
+						g_bassChannelSetAttributeOri = g_bassChannelSetAttributeInline.original<BASS_ChannelSetAttribute_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_ChannelSlideAttribute"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_ChannelSlideAttribute_Hook);
+					if (hook.has_value())
+					{
+						g_bassChannelSlideAttributeInline = std::move(*hook);
+						g_bassChannelSlideAttributeOri = g_bassChannelSlideAttributeInline.original<BASS_ChannelSlideAttribute_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_Pause"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_Pause_Hook);
+					if (hook.has_value())
+					{
+						g_bassPauseInline = std::move(*hook);
+						g_bassPauseOri = g_bassPauseInline.original<BASS_Pause_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_Stop"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_Stop_Hook);
+					if (hook.has_value())
+					{
+						g_bassStopInline = std::move(*hook);
+						g_bassStopOri = g_bassStopInline.original<BASS_Stop_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_SetConfig"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_SetConfig_Hook);
+					if (hook.has_value())
+					{
+						g_bassSetConfigInline = std::move(*hook);
+						g_bassSetConfigOri = g_bassSetConfigInline.original<BASS_SetConfig_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_SetVolume"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_SetVolume_Hook);
+					if (hook.has_value())
+					{
+						g_bassSetVolumeInline = std::move(*hook);
+						g_bassSetVolumeOri = g_bassSetVolumeInline.original<BASS_SetVolume_t>();
+						any = true;
+					}
+				}
+
+				if (auto proc = GetProcAddress(bass, "BASS_Free"))
+				{
+					auto hook = SafetyHookInline::create(proc, &BASS_Free_Hook);
+					if (hook.has_value())
+					{
+						g_bassFreeInline = std::move(*hook);
+						g_bassFreeOri = g_bassFreeInline.original<BASS_Free_t>();
+						any = true;
+					}
+				}
+
+				g_bassInlineHooksInstalled = any;
+			}
+
+			if (g_bassInlineHooksInstalled && g_bassUpdateOri)
+				EnsureBassUpdateThread();
+		}
+
+		// Fallback: hook imports in samp.dll/exe (works even if inline hooking BASS exports fails).
+		if (!g_bassIatHooksInstalled)
+			InstallBassIatHooks();
+	}
+}
 
 WindowedMode::WindowedMode(
 	GameTitle gameTitle,
@@ -49,6 +614,9 @@ HWND __stdcall WindowedMode::InitWindow(DWORD dwExStyle, LPCSTR lpClassName, LPC
 		return NULL;
 	}
 	inst->oriWindowProc = oriClass.lpfnWndProc;
+
+	if (inst->gameTitle == WindowedMode::GameTitle::GTA_SA)
+		InstallDirectSoundHooks();
 
 	inst->InitConfig();
 	bool maximize = inst->LoadConfig();
@@ -452,6 +1020,18 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
 			return result;
 		}
 
+		// don't pause/mute audio on app deactivation (GTA SA uses this message for audio streaming state)
+		case WM_ACTIVATEAPP:
+		{
+			auto result = (wParam == FALSE) ?
+				DefWindowProc(wnd, msg, wParam, lParam) :
+				CallWindowProc(inst->oriWindowProc, wnd, msg, wParam, lParam);
+
+			inst->WindowUpdateTitle();
+			inst->MouseUpdate(true);
+			return result;
+		}
+
 		// don't pause game on defocus
 		case WM_SETFOCUS:
 		case WM_KILLFOCUS:
@@ -690,6 +1270,12 @@ bool WindowedMode::IsD3D9() const
 
 HRESULT WindowedMode::D3dPresentHook(IDirect3DDevice8* self, const RECT* srcRect, const RECT* dstRect, HWND wnd, const RGNDATA* region)
 {
+	if (inst->gameTitle == GameTitle::GTA_SA)
+	{
+		UpdateFocusTracking();
+		InstallBassHooks();
+	}
+
 	inst->MouseUpdate();
 
 	if (inst->fpsCounter.update())
@@ -893,4 +1479,3 @@ void WindowedMode::UpdateWidescreenFix()
 	if (updateFunc)
 		injector::stdcall<void()>::call(updateFunc);
 }
-
