@@ -1,0 +1,40 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Generate project files
+        shell: cmd
+        run: premake5.bat
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build solution
+        shell: cmd
+        run: msbuild "build\III.VC.SA.WindowedMode.sln" /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+
+      - name: Create release archive
+        shell: cmd
+        run: |
+          cd data
+          release.bat
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: III.VC.SA.WindowedMode ${{ github.ref_name }}
+          files: data/III.VC.SA.WindowedMode.zip
+          body: "- [Readme](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)"
